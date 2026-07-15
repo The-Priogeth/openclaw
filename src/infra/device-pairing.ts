@@ -137,6 +137,7 @@ export type DevicePairingForbiddenReason =
   | "caller-scopes-required"
   | "caller-missing-scope"
   | "scope-outside-requested-roles"
+  | "mobile-scope-not-allowed"
   | "bootstrap-role-not-allowed"
   | "bootstrap-scope-not-allowed";
 
@@ -165,6 +166,16 @@ const OPERATOR_SCOPE_PREFIX = "operator.";
 const SHARED_GATEWAY_AUTH_ISSUER_KIND = "shared-gateway-auth";
 const BROWSER_DEVICE_CLIENT_IDS = new Set(["openclaw-control-ui", "webchat-ui"]);
 const BROWSER_DEVICE_CLIENT_MODE = "webchat";
+const MOBILE_OPERATOR_ALLOWED_SCOPES = ["operator.read", "operator.write"] as const;
+const MOBILE_OPERATOR_ALLOWED_SCOPE_SET = new Set<string>(MOBILE_OPERATOR_ALLOWED_SCOPES);
+const MOBILE_PAIRING_CLIENT_IDS = new Set([
+  "android",
+  "ios",
+  "mobile",
+  "openclaw-android",
+  "openclaw-ios",
+  "portalclient",
+]);
 
 const withLock = createAsyncLock();
 
@@ -177,6 +188,8 @@ export function formatDevicePairingForbiddenMessage(result: DevicePairingForbidd
       return `missing scope: ${result.scope ?? "unknown"}`;
     case "scope-outside-requested-roles":
       return `invalid scope for requested roles: ${result.scope ?? "unknown"}`;
+    case "mobile-scope-not-allowed":
+      return `mobile pairing does not allow scope: ${result.scope ?? "unknown"}`;
     case "bootstrap-role-not-allowed":
       return `bootstrap profile does not allow role: ${result.role ?? "unknown"}`;
     case "bootstrap-scope-not-allowed":
@@ -311,6 +324,128 @@ function mergeScopes(...items: Array<string[] | undefined>): string[] | undefine
   return [...scopes];
 }
 
+function normalizePolicyText(value: string | undefined): string {
+  return value?.trim().toLowerCase() ?? "";
+}
+
+function isMobilePortalPairingSurface(
+  input: Pick<
+    DevicePairingPendingRequest | PairedDevice,
+    "clientId" | "clientMode" | "displayName" | "deviceFamily" | "platform"
+  >,
+): boolean {
+  const clientId = normalizePolicyText(input.clientId);
+  if (clientId && MOBILE_PAIRING_CLIENT_IDS.has(clientId)) {
+    return true;
+  }
+  const clientMode = normalizePolicyText(input.clientMode);
+  if (clientMode === "mobile") {
+    return true;
+  }
+  const displayName = normalizePolicyText(input.displayName);
+  if (displayName.includes("portalclient") || displayName.includes("mobile")) {
+    return true;
+  }
+  const platform = normalizePolicyText(input.platform);
+  if (/^(?:android|ios|ipados)(?:\s|$)/.test(platform) || platform.includes("android")) {
+    return true;
+  }
+  const deviceFamily = normalizePolicyText(input.deviceFamily);
+  return /^(?:android|iphone|ipad|ios|mobile)$/.test(deviceFamily);
+}
+
+function isMobilePortalPairing(
+  pending: Pick<
+    DevicePairingPendingRequest,
+    "clientId" | "clientMode" | "displayName" | "deviceFamily" | "platform"
+  >,
+  existing?: Pick<
+    PairedDevice,
+    "clientId" | "clientMode" | "displayName" | "deviceFamily" | "platform"
+  >,
+): boolean {
+  return (
+    isMobilePortalPairingSurface(pending) ||
+    Boolean(existing && isMobilePortalPairingSurface(existing))
+  );
+}
+
+function clampMobileOperatorScopes(scopes: string[] | undefined): string[] | undefined {
+  if (!Array.isArray(scopes)) {
+    return undefined;
+  }
+  const normalized = normalizeDeviceAuthScopes(scopes);
+  return MOBILE_OPERATOR_ALLOWED_SCOPES.filter((scope) => normalized.includes(scope));
+}
+
+function findDisallowedMobileOperatorScope(scopes: readonly string[]): string | undefined {
+  return normalizeDeviceAuthScopes([...scopes]).find(
+    (scope) =>
+      scope.startsWith(OPERATOR_SCOPE_PREFIX) && !MOBILE_OPERATOR_ALLOWED_SCOPE_SET.has(scope),
+  );
+}
+
+function enforceMobilePortalPendingScopePolicy<T extends { scopes?: string[] }>(
+  pending: T &
+    Pick<
+      DevicePairingPendingRequest | PairedDevice,
+      "clientId" | "clientMode" | "displayName" | "deviceFamily" | "platform"
+    >,
+): T {
+  if (!isMobilePortalPairingSurface(pending)) {
+    return pending;
+  }
+  return {
+    ...pending,
+    scopes: clampMobileOperatorScopes(pending.scopes) ?? [],
+  };
+}
+
+function resolveApprovedScopesForPairing(
+  params: {
+    pending: Pick<
+      DevicePairingPendingRequest,
+      "clientId" | "clientMode" | "displayName" | "deviceFamily" | "platform"
+    >;
+    existing?: Pick<
+      PairedDevice,
+      "clientId" | "clientMode" | "displayName" | "deviceFamily" | "platform"
+    >;
+  },
+  ...items: Array<string[] | undefined>
+): string[] | undefined {
+  const approvedScopes = mergeScopes(...items);
+  if (!isMobilePortalPairing(params.pending, params.existing)) {
+    return approvedScopes;
+  }
+  return clampMobileOperatorScopes(approvedScopes) ?? [];
+}
+
+function resolveDeviceTokenScopesForPolicy(params: {
+  role: string;
+  scopes: string[];
+  pending?: Pick<
+    DevicePairingPendingRequest,
+    "clientId" | "clientMode" | "displayName" | "deviceFamily" | "platform"
+  >;
+  existing?: Pick<
+    PairedDevice,
+    "clientId" | "clientMode" | "displayName" | "deviceFamily" | "platform"
+  >;
+  device?: Pick<
+    PairedDevice,
+    "clientId" | "clientMode" | "displayName" | "deviceFamily" | "platform"
+  >;
+}): string[] {
+  if (params.role !== OPERATOR_ROLE) {
+    return params.scopes;
+  }
+  const isMobile =
+    (params.pending && isMobilePortalPairing(params.pending, params.existing)) ||
+    Boolean(params.device && isMobilePortalPairingSurface(params.device));
+  return isMobile ? clampMobileOperatorScopes(params.scopes) ?? [] : params.scopes;
+}
+
 function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
   if (left.length !== right.length) {
     return false;
@@ -356,7 +491,7 @@ function refreshPendingDevicePairingRequest(
   incoming: Omit<DevicePairingPendingRequest, "requestId" | "ts" | "isRepair">,
   isRepair: boolean,
 ): DevicePairingPendingRequest {
-  return {
+  return enforceMobilePortalPendingScopePolicy({
     ...existing,
     publicKey: incoming.publicKey,
     displayName: incoming.displayName ?? existing.displayName,
@@ -372,7 +507,7 @@ function refreshPendingDevicePairingRequest(
     // request's queue position. Using Date.now() here would let an attacker silently
     // refresh recency and win the implicit --latest approval race.
     ts: existing.ts,
-  };
+  });
 }
 
 function resolveSupersededPendingSilent(params: {
@@ -390,21 +525,22 @@ function buildPendingDevicePairingRequest(params: {
   isRepair: boolean;
   req: Omit<DevicePairingPendingRequest, "requestId" | "ts" | "isRepair">;
 }): DevicePairingPendingRequest {
-  const role = normalizeRole(params.req.role) ?? undefined;
+  const req = enforceMobilePortalPendingScopePolicy(params.req);
+  const role = normalizeRole(req.role) ?? undefined;
   return {
     requestId: params.requestId ?? randomUUID(),
     deviceId: params.deviceId,
-    publicKey: params.req.publicKey,
-    displayName: params.req.displayName,
-    platform: params.req.platform,
-    deviceFamily: params.req.deviceFamily,
-    clientId: params.req.clientId,
-    clientMode: params.req.clientMode,
+    publicKey: req.publicKey,
+    displayName: req.displayName,
+    platform: req.platform,
+    deviceFamily: req.deviceFamily,
+    clientId: req.clientId,
+    clientMode: req.clientMode,
     role,
-    roles: mergeRoles(params.req.roles, role),
-    scopes: mergeScopes(params.req.scopes),
-    remoteIp: params.req.remoteIp,
-    silent: params.req.silent,
+    roles: mergeRoles(req.roles, role),
+    scopes: mergeScopes(req.scopes),
+    remoteIp: req.remoteIp,
+    silent: req.silent,
     isRepair: params.isRepair,
     ts: Date.now(),
   };
@@ -529,20 +665,35 @@ function resolveApprovedTokenScopes(params: {
         ? pendingScopes.filter((scope) => !approvedBaseline.includes(scope))
         : pendingScopes;
     if (requestedScopeDelta.length === 0 && params.existingToken) {
-      return resolveRoleScopedDeviceTokenScopes(params.role, params.existingToken.scopes);
+      return resolveDeviceTokenScopesForPolicy({
+        role: params.role,
+        scopes: resolveRoleScopedDeviceTokenScopes(params.role, params.existingToken.scopes),
+        pending: params.pending,
+        existing: params.existing,
+      });
     }
-    return resolveRoleScopedDeviceTokenScopes(
-      params.role,
-      mergeScopes(params.existingToken?.scopes, requestedScopeDelta),
-    );
+    return resolveDeviceTokenScopesForPolicy({
+      role: params.role,
+      scopes: resolveRoleScopedDeviceTokenScopes(
+        params.role,
+        mergeScopes(params.existingToken?.scopes, requestedScopeDelta),
+      ),
+      pending: params.pending,
+      existing: params.existing,
+    });
   }
-  return resolveRoleScopedDeviceTokenScopes(
-    params.role,
-    params.existingToken?.scopes ??
-      params.approvedScopes ??
-      params.existing?.approvedScopes ??
-      params.existing?.scopes,
-  );
+  return resolveDeviceTokenScopesForPolicy({
+    role: params.role,
+    scopes: resolveRoleScopedDeviceTokenScopes(
+      params.role,
+      params.existingToken?.scopes ??
+        params.approvedScopes ??
+        params.existing?.approvedScopes ??
+        params.existing?.scopes,
+    ),
+    pending: params.pending,
+    existing: params.existing,
+  });
 }
 
 function resolveApprovedDeviceScopeBaseline(device: PairedDevice): string[] | null {
@@ -550,7 +701,10 @@ function resolveApprovedDeviceScopeBaseline(device: PairedDevice): string[] | nu
   if (!Array.isArray(baseline)) {
     return null;
   }
-  return normalizeDeviceAuthScopes(baseline);
+  const normalized = normalizeDeviceAuthScopes(baseline);
+  return isMobilePortalPairingSurface(device)
+    ? clampMobileOperatorScopes(normalized) ?? []
+    : normalized;
 }
 
 function scopesWithinApprovedDeviceBaseline(params: {
@@ -606,7 +760,8 @@ export async function requestDevicePairing(
 }> {
   return await withLock(async () => {
     const state = await loadState(baseDir);
-    const deviceId = normalizeDeviceId(req.deviceId);
+    const incoming = enforceMobilePortalPendingScopePolicy(req);
+    const deviceId = normalizeDeviceId(incoming.deviceId);
     if (!deviceId) {
       throw new Error("deviceId required");
     }
@@ -617,7 +772,7 @@ export async function requestDevicePairing(
     return await reconcilePendingPairingRequests({
       pendingById: state.pendingById,
       existing: pendingForDevice,
-      incoming: req,
+      incoming,
       canRefreshSingle: (existing, incoming) => samePendingApprovalSnapshot(existing, incoming),
       refreshSingle: (existing, incoming) =>
         refreshPendingDevicePairingRequest(existing, incoming, isRepair),
@@ -678,10 +833,13 @@ export async function approveDevicePairing(
   const baseDir = typeof optionsOrBaseDir === "string" ? optionsOrBaseDir : maybeBaseDir;
   return await withLock(async () => {
     const state = await loadState(baseDir);
-    const pending = state.pendingById[requestId];
-    if (!pending) {
+    const storedPending = state.pendingById[requestId];
+    if (!storedPending) {
       return null;
     }
+    const existing = state.pairedByDeviceId[storedPending.deviceId];
+    const pending = enforceMobilePortalPendingScopePolicy(storedPending);
+    const mobilePairing = isMobilePortalPairing(pending, existing);
     const requestedRoles = mergeRoles(pending.roles, pending.role) ?? [];
     const requestedScopes = normalizeDeviceAuthScopes(pending.scopes);
     const roleMismatchScope = resolveScopeOutsideRequestedRoles({
@@ -696,9 +854,9 @@ export async function approveDevicePairing(
       };
     }
     const now = Date.now();
-    const existing = state.pairedByDeviceId[pending.deviceId];
     const roles = mergeRoles(existing?.roles, existing?.role, pending.roles, pending.role);
-    const approvedScopes = mergeScopes(
+    const approvedScopes = resolveApprovedScopesForPairing(
+      { pending, existing },
       existing?.approvedScopes ?? existing?.scopes,
       pending.scopes,
     );
@@ -713,6 +871,26 @@ export async function approveDevicePairing(
         approvedScopes,
         existing,
       });
+      if (mobilePairing && roleForToken === OPERATOR_ROLE && nextScopes.length === 0) {
+        return {
+          status: "forbidden",
+          reason: "mobile-scope-not-allowed",
+          scope:
+            findDisallowedMobileOperatorScope(requestedScopes) ??
+            MOBILE_OPERATOR_ALLOWED_SCOPES[0],
+        };
+      }
+      const disallowedMobileScope =
+        mobilePairing && roleForToken === OPERATOR_ROLE
+          ? findDisallowedMobileOperatorScope(nextScopes)
+          : undefined;
+      if (disallowedMobileScope) {
+        return {
+          status: "forbidden",
+          reason: "mobile-scope-not-allowed",
+          scope: disallowedMobileScope,
+        };
+      }
       nextTokenScopesByRole.set(roleForToken, nextScopes);
       if (roleForToken === OPERATOR_ROLE && nextScopes.length > 0) {
         const callerRequiredScopes =
@@ -796,10 +974,13 @@ export async function approveBootstrapDevicePairing(
   );
   return await withLock(async () => {
     const state = await loadState(baseDir);
-    const pending = state.pendingById[requestId];
-    if (!pending) {
+    const storedPending = state.pendingById[requestId];
+    if (!storedPending) {
       return null;
     }
+    const existing = state.pairedByDeviceId[storedPending.deviceId];
+    const pending = enforceMobilePortalPendingScopePolicy(storedPending);
+    const mobilePairing = isMobilePortalPairing(pending, existing);
     const requestedRoles = resolveRequestedRoles(pending);
     const missingRole = requestedRoles.find((role) => !approvedRoles.includes(role));
     if (missingRole) {
@@ -818,7 +999,6 @@ export async function approveBootstrapDevicePairing(
     }
 
     const now = Date.now();
-    const existing = state.pairedByDeviceId[pending.deviceId];
     const grantedRoles = requestedRoles;
     const grantedScopes = resolveBootstrapProfileScopesForRoles(grantedRoles, pending.scopes ?? []);
     const grantedRoleSet = new Set(grantedRoles);
@@ -832,14 +1012,32 @@ export async function approveBootstrapDevicePairing(
             ),
     );
     const roles = mergeRoles(existing?.roles, existing?.role, pending.roles, pending.role);
-    const nextApprovedScopes = mergeScopes(preservedExistingScopes, grantedScopes);
+    const nextApprovedScopes = resolveApprovedScopesForPairing(
+      { pending, existing },
+      preservedExistingScopes,
+      grantedScopes,
+    );
     const tokens = existing?.tokens ? { ...existing.tokens } : {};
     for (const roleForToken of grantedRoles) {
       const existingToken = tokens[roleForToken];
-      const tokenScopes =
-        roleForToken === OPERATOR_ROLE
-          ? resolveBootstrapProfileScopesForRole(roleForToken, grantedScopes)
-          : [];
+      const tokenScopes = resolveDeviceTokenScopesForPolicy({
+        role: roleForToken,
+        scopes:
+          roleForToken === OPERATOR_ROLE
+            ? resolveBootstrapProfileScopesForRole(roleForToken, grantedScopes)
+            : [],
+        pending,
+        existing,
+      });
+      if (mobilePairing && roleForToken === OPERATOR_ROLE && tokenScopes.length === 0) {
+        return {
+          status: "forbidden",
+          reason: "mobile-scope-not-allowed",
+          scope:
+            findDisallowedMobileOperatorScope(grantedScopes) ??
+            MOBILE_OPERATOR_ALLOWED_SCOPES[0],
+        };
+      }
       tokens[roleForToken] = buildDeviceAuthToken({
         role: roleForToken,
         scopes: tokenScopes,
@@ -1091,17 +1289,22 @@ export async function verifyDeviceToken(params: {
       return { ok: false, reason: "legacy-browser-token" };
     }
     const approvedScopes = resolveApprovedDeviceScopeBaseline(device);
+    const effectiveEntryScopes = resolveDeviceTokenScopesForPolicy({
+      role,
+      scopes: entry.scopes,
+      device,
+    });
     if (
       !scopesWithinApprovedDeviceBaseline({
         role,
-        scopes: entry.scopes,
+        scopes: effectiveEntryScopes,
         approvedScopes,
       })
     ) {
       return { ok: false, reason: "scope-mismatch" };
     }
     const requestedScopes = normalizeDeviceAuthScopes(params.scopes);
-    if (!roleScopesAllow({ role, requestedScopes, allowedScopes: entry.scopes })) {
+    if (!roleScopesAllow({ role, requestedScopes, allowedScopes: effectiveEntryScopes })) {
       return { ok: false, reason: "scope-mismatch" };
     }
     const now = Date.now();
@@ -1126,7 +1329,6 @@ export async function ensureDeviceToken(params: {
 }): Promise<DeviceAuthToken | null> {
   return await withLock(async () => {
     const state = await loadState(params.baseDir);
-    const requestedScopes = normalizeDeviceAuthScopes(params.scopes);
     const context = resolveDeviceTokenUpdateContext({
       state,
       deviceId: params.deviceId,
@@ -1136,6 +1338,18 @@ export async function ensureDeviceToken(params: {
       return null;
     }
     const { device, role, tokens, existing } = context;
+    const requestedScopes = resolveDeviceTokenScopesForPolicy({
+      role,
+      scopes: normalizeDeviceAuthScopes(params.scopes),
+      device,
+    });
+    if (
+      role === OPERATOR_ROLE &&
+      isMobilePortalPairingSurface(device) &&
+      requestedScopes.length === 0
+    ) {
+      return null;
+    }
     const approvedScopes = resolveApprovedDeviceScopeBaseline(device);
     if (
       !scopesWithinApprovedDeviceBaseline({
@@ -1147,18 +1361,25 @@ export async function ensureDeviceToken(params: {
       return null;
     }
     if (existing && !existing.revokedAtMs) {
-      const existingWithinApproved = scopesWithinApprovedDeviceBaseline({
+      const effectiveExistingScopes = resolveDeviceTokenScopesForPolicy({
         role,
         scopes: existing.scopes,
+        device,
+      });
+      const existingWithinApproved = scopesWithinApprovedDeviceBaseline({
+        role,
+        scopes: effectiveExistingScopes,
         approvedScopes,
       });
       const issuerAllowsReuse = deviceTokenIssuerMatches(existing, params.issuer);
       if (
         existingWithinApproved &&
         issuerAllowsReuse &&
-        roleScopesAllow({ role, requestedScopes, allowedScopes: existing.scopes })
+        roleScopesAllow({ role, requestedScopes, allowedScopes: effectiveExistingScopes })
       ) {
-        return existing;
+        if (sameStringSet(existing.scopes, effectiveExistingScopes)) {
+          return existing;
+        }
       }
     }
     const now = Date.now();
@@ -1172,6 +1393,10 @@ export async function ensureDeviceToken(params: {
     });
     tokens[role] = next;
     device.tokens = tokens;
+    if (role === OPERATOR_ROLE && isMobilePortalPairingSurface(device) && approvedScopes) {
+      device.scopes = approvedScopes;
+      device.approvedScopes = approvedScopes;
+    }
     state.pairedByDeviceId[device.deviceId] = device;
     await persistState(state, params.baseDir, "paired");
     return next;
@@ -1225,9 +1450,18 @@ export async function rotateDeviceToken(params: {
       return { ok: false, reason: "unknown-device-or-role" };
     }
     const { device, role, tokens, existing } = context;
-    const requestedScopes = normalizeDeviceAuthScopes(
-      params.scopes ?? existing?.scopes ?? device.scopes,
-    );
+    const requestedScopes = resolveDeviceTokenScopesForPolicy({
+      role,
+      scopes: normalizeDeviceAuthScopes(params.scopes ?? existing?.scopes ?? device.scopes),
+      device,
+    });
+    if (
+      role === OPERATOR_ROLE &&
+      isMobilePortalPairingSurface(device) &&
+      requestedScopes.length === 0
+    ) {
+      return { ok: false, reason: "scope-outside-approved-baseline" };
+    }
     const approvedScopes = resolveApprovedDeviceScopeBaseline(device);
     if (!approvedScopes) {
       return { ok: false, reason: "missing-approved-scope-baseline" };
@@ -1262,6 +1496,10 @@ export async function rotateDeviceToken(params: {
     });
     tokens[role] = next;
     device.tokens = tokens;
+    if (role === OPERATOR_ROLE && isMobilePortalPairingSurface(device)) {
+      device.scopes = approvedScopes;
+      device.approvedScopes = approvedScopes;
+    }
     state.pairedByDeviceId[device.deviceId] = device;
     await persistState(state, params.baseDir, "paired");
     return { ok: true, entry: next };

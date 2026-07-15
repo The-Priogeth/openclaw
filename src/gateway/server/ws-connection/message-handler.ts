@@ -109,7 +109,7 @@ import { AUTH_RATE_LIMIT_SCOPE_NODE_PAIRING, type AuthRateLimiter } from "../../
 import type { GatewayAuthResult, ResolvedGatewayAuth } from "../../auth.js";
 import { hasForwardedRequestHeaders, isLocalDirectRequest } from "../../auth.js";
 import { normalizeDeviceMetadataForAuth } from "../../device-auth.js";
-import { ADMIN_SCOPE, APPROVALS_SCOPE } from "../../method-scopes.js";
+import { ADMIN_SCOPE, APPROVALS_SCOPE, READ_SCOPE, WRITE_SCOPE } from "../../method-scopes.js";
 import type { GatewayMethodRegistry } from "../../methods/registry.js";
 import {
   isLocalishHost,
@@ -348,6 +348,40 @@ function isSetupCodeMobileBootstrapClient(client: {
     return /^(?:ios|ipados)(?:\s|$)/.test(platform) && /^(?:iphone|ipad|ios)$/.test(deviceFamily);
   }
   return false;
+}
+
+const MOBILE_OPERATOR_ALLOWED_SCOPES = [READ_SCOPE, WRITE_SCOPE] as const;
+
+function isMobilePortalClient(client: {
+  id?: string;
+  displayName?: string;
+  mode?: string;
+  platform?: string;
+  deviceFamily?: string;
+}): boolean {
+  const text = [
+    client.id,
+    client.displayName,
+    client.mode,
+    client.platform,
+    client.deviceFamily,
+  ]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join(" ")
+    .toLowerCase();
+  return (
+    text.includes("portalclient") ||
+    text.includes("openclaw-android") ||
+    text.includes("openclaw-ios") ||
+    text.includes("android") ||
+    text.includes("ios") ||
+    text.includes("mobile")
+  );
+}
+
+function restrictMobileOperatorScopes(scopes: string[]): string[] {
+  const requestedScopes = new Set(normalizeSortedUniqueTrimmedStringList(scopes));
+  return MOBILE_OPERATOR_ALLOWED_SCOPES.filter((scope) => requestedScopes.has(scope));
 }
 
 function resolveTrustedProxyControlUiScopes(params: {
@@ -858,6 +892,19 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
           (connectParams.client.id === GATEWAY_CLIENT_IDS.MACOS_APP ||
             connectParams.client.id === GATEWAY_CLIENT_IDS.IOS_APP ||
             connectParams.client.id === GATEWAY_CLIENT_IDS.ANDROID_APP);
+        if (role === "operator" && isMobilePortalClient(connectParams.client)) {
+          const requestedScopes = scopes;
+          const restrictedScopes = restrictMobileOperatorScopes(requestedScopes);
+          if (restrictedScopes.length !== requestedScopes.length) {
+            logGateway.warn(
+              `security audit: restricted mobile operator scopes client=${connectParams.client.id} ` +
+                `requested=${requestedScopes.join(",") || "<none>"} ` +
+                `granted=${restrictedScopes.join(",") || "<none>"}`,
+            );
+          }
+          scopes = restrictedScopes;
+          connectParams.scopes = scopes;
+        }
         if (enforceOriginCheckForAnyClient || isBrowserOperatorUi || isWebchat) {
           const hostHeaderOriginFallbackEnabled =
             configSnapshot.gateway?.controlUi?.dangerouslyAllowHostHeaderOriginFallback === true;

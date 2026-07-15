@@ -388,6 +388,217 @@ describe("device pairing tokens", () => {
     ).resolves.toEqual({ ok: true });
   });
 
+  test("restricts mobile pending and approved operator scopes to read/write", async () => {
+    const baseDir = await makeDevicePairingDir();
+    const request = await requestDevicePairing(
+      {
+        deviceId: "mobile-device-1",
+        publicKey: "public-key-mobile-1",
+        displayName: "Mobile PortalClient",
+        clientId: "openclaw-android",
+        clientMode: "ui",
+        platform: "Android 16",
+        deviceFamily: "Android",
+        role: "operator",
+        scopes: [
+          "operator.admin",
+          "operator.read",
+          "operator.write",
+          "operator.approvals",
+          "operator.pairing",
+        ],
+      },
+      baseDir,
+    );
+
+    expect(request.request.scopes).toEqual(["operator.read", "operator.write"]);
+
+    const approved = await approveDevicePairing(
+      request.request.requestId,
+      { callerScopes: ["operator.read", "operator.write"] },
+      baseDir,
+    );
+    expectRecordFields(approved, "approved result", { status: "approved" });
+
+    const paired = await getPairedDevice("mobile-device-1", baseDir);
+    expect(paired?.roles).toEqual(["operator"]);
+    expect(paired?.approvedScopes).toEqual(["operator.read", "operator.write"]);
+    expect(paired?.tokens?.operator?.scopes).toEqual(["operator.read", "operator.write"]);
+    await expect(
+      verifyDeviceToken({
+        deviceId: "mobile-device-1",
+        token: requireToken(paired?.tokens?.operator?.token),
+        role: "operator",
+        scopes: ["operator.admin"],
+        baseDir,
+      }),
+    ).resolves.toEqual({ ok: false, reason: "scope-mismatch" });
+  });
+
+  test("does not preserve broad existing approved scopes for mobile approval", async () => {
+    const baseDir = await makeDevicePairingDir();
+    const initial = await requestDevicePairing(
+      {
+        deviceId: "mobile-device-existing",
+        publicKey: "public-key-mobile-existing",
+        displayName: "Mobile PortalClient",
+        clientId: "openclaw-android",
+        clientMode: "ui",
+        platform: "Android 16",
+        deviceFamily: "Android",
+        role: "operator",
+        scopes: ["operator.read", "operator.write"],
+      },
+      baseDir,
+    );
+    await approveDevicePairing(
+      initial.request.requestId,
+      { callerScopes: ["operator.read", "operator.write"] },
+      baseDir,
+    );
+    await mutatePairedDevice(baseDir, "mobile-device-existing", (device) => {
+      device.scopes = [
+        "operator.admin",
+        "operator.read",
+        "operator.write",
+        "operator.approvals",
+        "operator.pairing",
+      ];
+      device.approvedScopes = [...device.scopes];
+      if (device.tokens?.operator) {
+        device.tokens.operator.scopes = [...device.scopes];
+      }
+    });
+
+    const repair = await requestDevicePairing(
+      {
+        deviceId: "mobile-device-existing",
+        publicKey: "public-key-mobile-existing",
+        displayName: "Mobile PortalClient",
+        clientId: "openclaw-android",
+        clientMode: "ui",
+        platform: "Android 16",
+        deviceFamily: "Android",
+        role: "operator",
+        scopes: ["operator.read", "operator.write"],
+      },
+      baseDir,
+    );
+    const approved = await approveDevicePairing(
+      repair.request.requestId,
+      { callerScopes: ["operator.read", "operator.write"] },
+      baseDir,
+    );
+    expectRecordFields(approved, "approved result", { status: "approved" });
+
+    const paired = await getPairedDevice("mobile-device-existing", baseDir);
+    expect(paired?.approvedScopes).toEqual(["operator.read", "operator.write"]);
+    expect(paired?.tokens?.operator?.scopes).toEqual(["operator.read", "operator.write"]);
+  });
+
+  test("rotating a mobile operator token reduces broad stored scopes to read/write", async () => {
+    const baseDir = await makeDevicePairingDir();
+    const request = await requestDevicePairing(
+      {
+        deviceId: "mobile-device-rotate",
+        publicKey: "public-key-mobile-rotate",
+        displayName: "Mobile PortalClient",
+        clientId: "openclaw-android",
+        clientMode: "ui",
+        platform: "Android 16",
+        deviceFamily: "Android",
+        role: "operator",
+        scopes: ["operator.read", "operator.write"],
+      },
+      baseDir,
+    );
+    await approveDevicePairing(
+      request.request.requestId,
+      { callerScopes: ["operator.read", "operator.write"] },
+      baseDir,
+    );
+    await mutatePairedDevice(baseDir, "mobile-device-rotate", (device) => {
+      device.scopes = [
+        "operator.admin",
+        "operator.read",
+        "operator.write",
+        "operator.approvals",
+        "operator.pairing",
+      ];
+      device.approvedScopes = [...device.scopes];
+      if (device.tokens?.operator) {
+        device.tokens.operator.scopes = [...device.scopes];
+      }
+    });
+
+    const rotated = await rotateDeviceToken({
+      deviceId: "mobile-device-rotate",
+      role: "operator",
+      scopes: ["operator.admin", "operator.read", "operator.write", "operator.approvals"],
+      callerScopes: ["operator.admin", "operator.read", "operator.write", "operator.approvals"],
+      baseDir,
+    });
+    const entry = requireRotatedEntry(rotated);
+    expect(entry.scopes).toEqual(["operator.read", "operator.write"]);
+
+    const paired = await getPairedDevice("mobile-device-rotate", baseDir);
+    expect(paired?.approvedScopes).toEqual(["operator.read", "operator.write"]);
+    expect(paired?.tokens?.operator?.scopes).toEqual(["operator.read", "operator.write"]);
+  });
+
+  test("keeps non-mobile operator approvals unchanged", async () => {
+    const baseDir = await makeDevicePairingDir();
+    const request = await requestDevicePairing(
+      {
+        deviceId: "desktop-operator-device",
+        publicKey: "public-key-desktop-operator",
+        displayName: "OpenClaw Control UI",
+        clientId: "openclaw-control-ui",
+        clientMode: "webchat",
+        platform: "web",
+        role: "operator",
+        scopes: [
+          "operator.admin",
+          "operator.read",
+          "operator.write",
+          "operator.approvals",
+          "operator.pairing",
+        ],
+      },
+      baseDir,
+    );
+    const approved = await approveDevicePairing(
+      request.request.requestId,
+      {
+        callerScopes: [
+          "operator.admin",
+          "operator.read",
+          "operator.write",
+          "operator.approvals",
+          "operator.pairing",
+        ],
+      },
+      baseDir,
+    );
+    expectRecordFields(approved, "approved result", { status: "approved" });
+
+    const paired = await getPairedDevice("desktop-operator-device", baseDir);
+    expect(paired?.approvedScopes).toEqual([
+      "operator.admin",
+      "operator.read",
+      "operator.write",
+      "operator.approvals",
+      "operator.pairing",
+    ]);
+    expect(paired?.tokens?.operator?.scopes).toEqual([
+      "operator.admin",
+      "operator.approvals",
+      "operator.pairing",
+      "operator.read",
+      "operator.write",
+    ]);
+  });
+
   test("preserves existing operator token scopes when approving a scope upgrade", async () => {
     const baseDir = await makeDevicePairingDir();
     await setupPairedOperatorDevice(baseDir, ["operator.read"]);
